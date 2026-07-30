@@ -1,0 +1,24 @@
+# Core runtime - everything in the default pipeline works with just these.
+numpy>=1.24
+pypdf>=4.0
+python-dotenv>=1.0
+
+# Tests
+pytest>=7.4
+
+# ---------------------------------------------------------------------------
+# Optional backends. Install what you need; the pipeline detects them at import
+# time and falls back gracefully when they are missing.
+#
+#   Dense semantic embeddings (NLP_RAG_EMBEDDING_BACKEND=sentence-transformers):
+#     pip install sentence-transformers torch
+#
+#   ANN vector index (NLP_RAG_VECTOR_BACKEND=faiss):
+#     pip install faiss-cpu
+#
+#   Local generation with a Hugging Face causal LM (NLP_RAG_GENERATOR=transformers):
+#     pip install transformers torch
+#
+#   Claude-backed generation (NLP_RAG_GENERATOR=anthropic, needs ANTHROPIC_API_KEY):
+#     pip install anthropic
+# ---------------------------------------------------------------------------

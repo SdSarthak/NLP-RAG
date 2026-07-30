@@ -1,0 +1,48 @@
+# Environment / secrets
+.env
+.env.local
+*.pem
+*.key
+credentials.json
+serviceAccount*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+venv/
+env/
+.venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node (in case a UI is added later)
+node_modules/
+
+# Model checkpoints / large artefacts
+*.h5
+*.pt
+*.pkl
+*.ckpt
+*.onnx
+*.safetensors
+
+# Local index / cache artefacts
+storage/
+.index/
+*.faiss
+*.npy
+*.npz
+*.sqlite3
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
