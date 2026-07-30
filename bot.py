@@ -1,93 +1,122 @@
-# Import libraries
-from PyPDF2 import PdfReader
-from langchain.text_splitter import CharacterTextSplitter
-from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
-from transformers import GPT2Tokenizer, GPT2LMHeadModel, pipeline
-from langchain.chains import RetrievalQA
-from langchain.llms import HuggingFacePipeline
-from langchain.schema import BaseRetriever, Document
-from typing import List
+"""Ask questions about a PDF.
 
-# Step 1: Load and preprocess the PDF
-def load_pdf(file_path):
-    reader = PdfReader(file_path)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text()
-    return text
+This is the original notebook-style script rebuilt on top of the ``nlp_rag``
+package: load a PDF, chunk it, index it, then answer questions with citations.
 
-# Load your PDF
-pdf_text = load_pdf("C:/Users/sarth/OneDrive/Desktop/Projects/NLP RAG/NLP Journal.pdf")  # Replace with your PDF file path
+    python bot.py                                  # uses "NLP Journal.pdf"
+    python bot.py --pdf paper.pdf --question "What is NLP?"
+    python bot.py --pdf paper.pdf --chat
+"""
 
-# Step 2: Split text into chunks
-text_splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-texts = text_splitter.split_text(pdf_text)
+from __future__ import annotations
 
-# Step 3: Create embeddings and FAISS index
-embedder = SentenceTransformer('all-MiniLM-L6-v2')  # Lightweight embedding model
-embeddings = embedder.encode(texts)
+import argparse
+import logging
+import sys
+from pathlib import Path
 
-# Build FAISS index with float32 conversion
-dimension = embeddings.shape[1]
-index = faiss.IndexFlatL2(dimension)
-index.add(np.array(embeddings).astype("float32"))
+from nlp_rag.cli import print_answer, run_chat
+from nlp_rag.config import GENERATORS, RETRIEVERS, RAGConfig
+from nlp_rag.documents import DocumentError, load_pdf
+from nlp_rag.pipeline import RAGPipeline
 
-# Step 4: Set up the retriever
-def retrieve(query, top_k=3):
-    query_embedding = embedder.encode([query]).astype("float32")
-    distances, indices = index.search(query_embedding, top_k)
-    relevant_chunks = [texts[i] for i in indices[0]]
-    return relevant_chunks
+DEFAULT_PDF = Path(__file__).with_name("NLP Journal.pdf")
+DEFAULT_QUESTIONS = [
+    "What is NLP?",
+    "What is retrieval-augmented generation?",
+]
 
-# Step 5: Set up GPT-2 for generation
-tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-model = GPT2LMHeadModel.from_pretrained("gpt2")
 
-def generate_answer(query, context):
-    input_text = f"Question: {query}\nContext: {context}\nAnswer:"
-    inputs = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-    outputs = model.generate(**inputs, max_length=500, num_return_sequences=1)
-    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return answer
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--pdf",
+        type=Path,
+        default=DEFAULT_PDF,
+        help=f"PDF to index (default: {DEFAULT_PDF.name})",
+    )
+    parser.add_argument(
+        "--question",
+        action="append",
+        dest="questions",
+        help="Question to ask; repeat for several",
+    )
+    parser.add_argument("--top-k", type=int, default=4, help="Chunks to retrieve")
+    parser.add_argument("--chunk-size", type=int, default=800)
+    parser.add_argument("--chunk-overlap", type=int, default=120)
+    parser.add_argument("--retriever", choices=RETRIEVERS, default="hybrid")
+    parser.add_argument("--generator", choices=GENERATORS, default="extractive")
+    parser.add_argument(
+        "--chat", action="store_true", help="Start an interactive session afterwards"
+    )
+    parser.add_argument(
+        "--save-index",
+        type=Path,
+        default=None,
+        help="Persist the index to this directory for reuse",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true")
+    return parser
 
-# Create a generator pipeline
-generator_pipeline = pipeline(
-    "text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    max_new_tokens=100,
-    device="cpu"  # Switch to "cuda" if GPU is available
-)
 
-# Create a LangChain LLM wrapper
-llm = HuggingFacePipeline(pipeline=generator_pipeline)
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 
-# Step 6: Define a custom retriever
-class CustomRetriever(BaseRetriever):
-    def __init__(self, retrieve_function):
-        super().__init__()
-        self._retrieve_function = retrieve_function
+    if not args.pdf.exists():
+        print(
+            f"PDF not found: {args.pdf}\n"
+            "Pass one with --pdf, or run `python main.py demo` for the "
+            "zero-setup sample corpus.",
+            file=sys.stderr,
+        )
+        return 1
 
-    def get_relevant_documents(self, query: str) -> List[Document]:
-        relevant_chunks = self._retrieve_function(query)
-        return [Document(page_content=chunk) for chunk in relevant_chunks]
+    config = RAGConfig.from_env(
+        chunk_size=args.chunk_size,
+        chunk_overlap=args.chunk_overlap,
+        retriever=args.retriever,
+        generator=args.generator,
+        top_k=args.top_k,
+    )
 
-    async def aget_relevant_documents(self, query: str) -> List[Document]:
-        raise NotImplementedError("Async version not implemented")
+    try:
+        document = load_pdf(args.pdf)
+    except DocumentError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
-# Create the retriever
-retriever = CustomRetriever(retrieve)
+    if not document.text.strip():
+        print(
+            f"No text could be extracted from {args.pdf} - it is probably a scan.",
+            file=sys.stderr,
+        )
+        return 1
 
-# Step 7: Build the RAG chain
-rag_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",
-    retriever=retriever
-)
+    pipeline = RAGPipeline.build(config)
+    chunks = pipeline.index_documents([document])
+    print(
+        f"Indexed {chunks} chunk(s) from {args.pdf.name} "
+        f"({document.metadata.get('pages', '?')} pages)."
+    )
 
-# Step 8: Query the RAG system
-query = "What is NLP?"  # Replace with your question
-result = rag_chain.run(query)
-print("Answer:", result)
+    if args.save_index:
+        pipeline.save(args.save_index)
+        print(f"Index saved to {args.save_index}")
+
+    for question in args.questions or DEFAULT_QUESTIONS:
+        print("\n" + "=" * 70)
+        print(f"Question: {question}")
+        print_answer(pipeline.answer(question))
+
+    if args.chat:
+        print()
+        return run_chat(pipeline, top_k=args.top_k)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
