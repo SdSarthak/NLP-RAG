@@ -17,7 +17,12 @@ from nlp_rag.retrieval import (
     build_retriever,
     content_tokens,
 )
-from nlp_rag.vectorstore import VectorStore, get_vector_store, load_vector_store
+from nlp_rag.vectorstore import (
+    VectorStore,
+    get_vector_store,
+    load_vector_store,
+    read_index_meta,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +115,9 @@ class RAGPipeline:
     ) -> "RAGPipeline":
         """Load a persisted index and rebuild the retrieval structures."""
         directory = Path(directory)
-        store, meta = load_vector_store(directory, config=None)
+        # Read the metadata before the vectors: a dimension mismatch is then
+        # reported without first loading (and copying) the whole matrix.
+        meta = read_index_meta(directory)
 
         saved_config = meta.get("config") or {}
         if config is None:
@@ -118,18 +125,23 @@ class RAGPipeline:
         config = config.replace(index_dir=directory)
 
         embedder = get_embedder(config)
+        index_dim = int(meta.get("dim") or 0)
+        if index_dim and embedder.dim != index_dim:
+            saved_embedder = meta.get("embedder") or {}
+            raise ValueError(
+                f"Embedder dim {embedder.dim} does not match index dim {index_dim}. "
+                "Re-index, or set the embedding backend used at index time "
+                f"({saved_embedder.get('name', 'unknown')})."
+            )
+
+        # Load straight into the configured backend rather than loading into a
+        # NumPy store and copying: that held two full copies of the matrix.
+        store, meta = load_vector_store(directory, config=config)
         if embedder.dim != store.dim:
             raise ValueError(
                 f"Embedder dim {embedder.dim} does not match index dim {store.dim}. "
-                "Re-index, or set the embedding backend used at index time "
-                f"({meta.get('embedder', {}).get('name', 'unknown')})."
+                "Re-index with a matching embedding backend."
             )
-
-        # Move the loaded vectors into the configured backend when they differ.
-        target = get_vector_store(config, store.dim)
-        if target.backend != store.backend:
-            target.add(store.vectors(), store.chunks)
-            store = target
 
         pipeline = cls(config, embedder, store, get_generator(config))
         pipeline.bm25.add(store.chunks)
