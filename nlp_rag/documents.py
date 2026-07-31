@@ -19,16 +19,29 @@ PDF_SUFFIXES = {".pdf"}
 SUPPORTED_SUFFIXES = TEXT_SUFFIXES | PDF_SUFFIXES
 
 _PARAGRAPH_RE = re.compile(r"\n\s*\n+")
-_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
-_WHITESPACE_RE = re.compile(r"[ \t\r\f\v]+")
+# Sentence boundaries. CJK terminators are not followed by a space, so they end a
+# sentence on their own; Latin terminators still require following whitespace so
+# that "e.g." or "3.5" are not split.
+SENTENCE_RE = re.compile(r"(?<=[。！？])\s*|(?<=[.!?])\s+")
+_SENTENCE_RE = SENTENCE_RE  # backwards-compatible alias
+# Includes the Unicode spaces that PDF extraction routinely emits (NBSP, en/em
+# spaces, ideographic space); without them normalisation leaves ragged runs.
+_WHITESPACE_RE = re.compile(
+    "[ \t\r\f\v\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]+"
+)
 HEADING_RE = re.compile(r"^(#{1,6}\s+\S.*)$", re.MULTILINE)
 _DOT_LEADER_RE = re.compile(r"\.{4,}")
-_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+# Runs of letters in any script - not just A-Z, or every non-Latin document
+# would be classified as noise and silently dropped.
+_WORD_RE = re.compile(r"[^\W\d_]{2,}", re.UNICODE)
 
 # A chunk this sparse in real words is page furniture (contents pages, figure
 # axes, reference numbering) rather than content worth retrieving.
 MIN_ALPHA_RATIO = 0.45
 MIN_WORDS = 2
+# Scripts written without spaces (Chinese, Japanese, Thai) yield one long run
+# rather than several words, so accept them on total letter count instead.
+MIN_LETTERS = 8
 
 
 class DocumentError(RuntimeError):
@@ -94,7 +107,7 @@ def _split_units(text: str) -> List[str]:
         paragraph = paragraph.replace("\n", " ").strip()
         if not paragraph:
             continue
-        for sentence in _SENTENCE_RE.split(paragraph):
+        for sentence in SENTENCE_RE.split(paragraph):
             sentence = sentence.strip()
             if sentence:
                 units.append(sentence)
@@ -225,7 +238,10 @@ def is_meaningful(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
-    if len(_WORD_RE.findall(stripped)) < MIN_WORDS:
+    words = _WORD_RE.findall(stripped)
+    # Space-separated scripts are judged on word count; scripts written without
+    # spaces produce a single long run, so they are judged on letter count.
+    if len(words) < MIN_WORDS and sum(len(word) for word in words) < MIN_LETTERS:
         return False
     letters = sum(1 for character in stripped if character.isalpha())
     return letters / len(stripped) >= MIN_ALPHA_RATIO

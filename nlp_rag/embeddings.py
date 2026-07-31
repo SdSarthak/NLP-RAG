@@ -22,11 +22,18 @@ from nlp_rag.config import RAGConfig
 
 logger = logging.getLogger(__name__)
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Letters and digits in *any* script, underscore excluded so that it can be used
+# as an unambiguous n-gram joiner. On pure-ASCII text this matches exactly what
+# ``[a-z0-9]+`` matched, so indexes built by earlier versions stay valid.
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
 
 def tokenize(text: str) -> List[str]:
-    """Lowercase word tokenizer shared by the lexical components."""
+    """Lowercase word tokenizer shared by the lexical components.
+
+    Unicode-aware: Cyrillic, Greek, CJK and accented Latin text produce tokens
+    instead of being silently discarded.
+    """
     return _TOKEN_RE.findall(text.lower())
 
 
@@ -85,6 +92,8 @@ class HashingEmbedder(Embedder):
         tokens = tokenize(text)
         features: Counter = Counter(tokens)
         if self.use_bigrams:
+            # Tokens never contain "_", so a bigram key cannot collide with a
+            # unigram key.
             features.update(
                 f"{a}_{b}" for a, b in zip(tokens, tokens[1:])
             )

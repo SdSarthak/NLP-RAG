@@ -17,11 +17,11 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Sequence
 
 from nlp_rag.config import RAGConfig
+from nlp_rag.documents import SENTENCE_RE
 from nlp_rag.retrieval import RetrievedChunk, content_tokens
 
 logger = logging.getLogger(__name__)
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _HEADING_LINE_RE = re.compile(r"^#{1,6}\s+")
 
 NO_CONTEXT_ANSWER = (
@@ -102,7 +102,7 @@ class ExtractiveGenerator(Generator):
             if not line or _HEADING_LINE_RE.match(line):
                 continue
             sentences.extend(
-                part.strip() for part in _SENTENCE_SPLIT_RE.split(line) if part.strip()
+                part.strip() for part in SENTENCE_RE.split(line) if part.strip()
             )
         return sentences
 

@@ -15,7 +15,7 @@ import logging
 import sys
 from pathlib import Path
 
-from nlp_rag.cli import print_answer, run_chat
+from nlp_rag.cli import configure_stdio, print_answer, run_chat
 from nlp_rag.config import GENERATORS, RETRIEVERS, RAGConfig
 from nlp_rag.documents import DocumentError, load_pdf
 from nlp_rag.pipeline import RAGPipeline
@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    configure_stdio()
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

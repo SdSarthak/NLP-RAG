@@ -33,6 +33,31 @@ logger = logging.getLogger(__name__)
 BANNER = "=" * 70
 
 
+def configure_stdio() -> None:
+    """Make stdout/stderr survive text the local encoding cannot represent.
+
+    On Windows the console encoding defaults to a legacy code page (cp1252),
+    so printing an answer that quotes an arrow, a dash or any non-Latin script
+    raises ``UnicodeEncodeError`` and kills the command. Redirected output is
+    switched to UTF-8 (the right thing for files and pipes); a real console
+    keeps its encoding but stops raising.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # pragma: no cover - replaced stream in tests
+            continue
+        encoding = (getattr(stream, "encoding", None) or "").lower()
+        try:
+            if encoding.replace("-", "") in {"utf8", "utf8mb4"}:
+                reconfigure(errors="replace")
+            elif stream.isatty():
+                reconfigure(errors="replace")
+            else:
+                reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):  # pragma: no cover - exotic streams
+            pass
+
+
 def configure_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.INFO if verbose else logging.WARNING,
@@ -315,6 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    configure_stdio()
     parser = build_parser()
     args = parser.parse_args(argv or ["demo"])
     configure_logging(getattr(args, "verbose", False))
