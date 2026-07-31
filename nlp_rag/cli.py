@@ -23,6 +23,7 @@ from nlp_rag.config import (
     VECTOR_BACKENDS,
     RAGConfig,
 )
+from nlp_rag.documents import DocumentError
 from nlp_rag.evaluation import EvalDatasetError, evaluate, load_eval_dataset
 from nlp_rag.pipeline import ConversationalRAG, RAGAnswer, RAGPipeline
 from nlp_rag.samples import sample_documents
@@ -120,9 +121,24 @@ def cmd_index(args: argparse.Namespace) -> int:
     else:
         pipeline = RAGPipeline.build(config)
 
-    added = pipeline.index_paths(args.paths, recursive=not args.no_recursive)
+    try:
+        added = pipeline.index_paths(args.paths, recursive=not args.no_recursive)
+    except DocumentError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     if not added:
-        print("Nothing was indexed - no supported documents found.")
+        if len(pipeline.store):
+            # Re-indexing unchanged content is a no-op, not a failure.
+            print(
+                f"Nothing new to index - all chunks are already present. "
+                f"Index holds {len(pipeline.store)} chunk(s) at '{index_dir}'."
+            )
+            return 0
+        print(
+            "Nothing was indexed - no supported documents were found in "
+            f"{', '.join(str(p) for p in args.paths)}."
+        )
         return 1
 
     pipeline.save(index_dir)

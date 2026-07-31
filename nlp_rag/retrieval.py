@@ -9,6 +9,8 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence
 
+import numpy as np
+
 from nlp_rag.config import RAGConfig
 from nlp_rag.documents import Chunk
 from nlp_rag.embeddings import Embedder, tokenize
@@ -74,9 +76,16 @@ class DenseRetriever(Retriever):
         self.embedder = embedder
 
     def retrieve(self, query: str, top_k: int) -> List[RetrievedChunk]:
-        if not query.strip() or len(self.store) == 0:
+        if top_k <= 0 or not query.strip() or len(self.store) == 0:
             return []
         vector = self.embedder.encode_one(query)
+        # A query with no in-vocabulary features (punctuation, an unsupported
+        # script for a lexical embedder) embeds to the zero vector, which scores
+        # every chunk 0.0 and would return an arbitrary slice of the index as if
+        # it were relevant.
+        if not np.any(vector):
+            logger.debug("Query %r produced an empty embedding; no dense hits", query[:60])
+            return []
         hits = self.store.search(vector, top_k)
         return [
             RetrievedChunk(
