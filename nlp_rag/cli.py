@@ -23,7 +23,7 @@ from nlp_rag.config import (
     VECTOR_BACKENDS,
     RAGConfig,
 )
-from nlp_rag.evaluation import evaluate, load_eval_dataset
+from nlp_rag.evaluation import EvalDatasetError, evaluate, load_eval_dataset
 from nlp_rag.pipeline import ConversationalRAG, RAGAnswer, RAGPipeline
 from nlp_rag.samples import sample_documents
 from nlp_rag.vectorstore import META_FILE
@@ -192,7 +192,11 @@ def run_chat(pipeline: RAGPipeline, top_k: Optional[int] = None) -> int:
 
 def cmd_eval(args: argparse.Namespace) -> int:
     pipeline = load_pipeline(args)
-    examples = load_eval_dataset(args.dataset)
+    try:
+        examples = load_eval_dataset(args.dataset)
+    except EvalDatasetError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     if not examples:
         print(f"No examples found in {args.dataset}")
         return 1

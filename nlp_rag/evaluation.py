@@ -7,7 +7,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 from nlp_rag.documents import Chunk
 from nlp_rag.embeddings import tokenize
@@ -156,17 +156,57 @@ class EvalExample:
         return any(s.lower() in lowered for s in self.relevant_substrings)
 
 
+class EvalDatasetError(ValueError):
+    """Raised when an evaluation dataset cannot be parsed."""
+
+
 def load_eval_dataset(path: Path | str) -> List[EvalExample]:
-    """Read a JSONL (or JSON list) evaluation dataset."""
+    """Read a JSONL (or JSON list) evaluation dataset.
+
+    Parse failures name the offending line so a one-character typo in a large
+    dataset does not turn into an unlocatable ``JSONDecodeError``.
+    """
     path = Path(path)
-    raw = path.read_text(encoding="utf-8").strip()
+    if not path.exists():
+        raise EvalDatasetError(f"No such evaluation dataset: {path}")
+    if path.is_dir():
+        raise EvalDatasetError(f"Evaluation dataset is a directory: {path}")
+
+    raw = path.read_text(encoding="utf-8", errors="replace").strip()
     if not raw:
         return []
+
+    records: List[Any]
     if raw.lstrip().startswith("["):
-        records = json.loads(raw)
+        try:
+            records = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise EvalDatasetError(f"{path} is not valid JSON: {exc}") from exc
+        if not isinstance(records, list):
+            raise EvalDatasetError(f"{path} must contain a list of examples")
     else:
-        records = [json.loads(line) for line in raw.splitlines() if line.strip()]
-    return [EvalExample.from_dict(record) for record in records]
+        records = []
+        for number, line in enumerate(raw.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise EvalDatasetError(
+                    f"{path}:{number} is not valid JSON: {exc}"
+                ) from exc
+
+    examples: List[EvalExample] = []
+    for number, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            raise EvalDatasetError(
+                f"{path}: example {number} must be an object, got {type(record).__name__}"
+            )
+        try:
+            examples.append(EvalExample.from_dict(record))
+        except ValueError as exc:
+            raise EvalDatasetError(f"{path}: example {number}: {exc}") from exc
+    return examples
 
 
 @dataclass
@@ -200,19 +240,67 @@ def _average(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def corpus_chunks(pipeline: Any) -> Optional[List[Chunk]]:
+    """Best-effort access to every indexed chunk, for grounding relevance."""
+    store = getattr(pipeline, "store", None)
+    chunks = getattr(store, "chunks", None)
+    if chunks is None:
+        chunks = getattr(pipeline, "chunks", None)
+    if chunks is None:
+        return None
+    return list(chunks)
+
+
+def resolve_relevant(
+    example: EvalExample, corpus: Optional[Sequence[Chunk]]
+) -> Set[str]:
+    """Ground-truth chunk ids for ``example``.
+
+    Substring labels are resolved against the **whole corpus**. Resolving them
+    against the retrieved results instead (as this harness originally did) makes
+    the ground truth a subset of the prediction, which silently inflates nDCG and
+    makes recall unmeasurable - a retriever that misses a relevant chunk is never
+    penalised for it because that chunk never enters the relevance set.
+    """
+    relevant: Set[str] = set(example.relevant_ids)
+    if corpus is not None and example.relevant_substrings:
+        relevant.update(chunk.id for chunk in corpus if example.matches(chunk))
+    return relevant
+
+
 def evaluate(
     pipeline: Any,
     examples: Sequence[EvalExample],
     k: int = 5,
     generate_answers: bool = False,
+    corpus: Optional[Sequence[Chunk]] = None,
 ) -> EvaluationReport:
     """Run retrieval (and optionally generation) over a labelled dataset.
 
     ``pipeline`` is any object exposing ``retrieve(question, top_k)`` and, when
-    ``generate_answers`` is set, ``answer(question, top_k)``.
+    ``generate_answers`` is set, ``answer(question, top_k)``. ``corpus`` defaults
+    to every chunk the pipeline has indexed and is what substring labels are
+    matched against.
     """
     if k <= 0:
         raise ValueError("k must be positive")
+    if not hasattr(pipeline, "retrieve"):
+        raise TypeError("pipeline must expose retrieve(question, top_k)")
+    if generate_answers and not hasattr(pipeline, "answer"):
+        raise TypeError(
+            "generate_answers=True requires a pipeline exposing answer(question, top_k)"
+        )
+
+    if corpus is None:
+        corpus = corpus_chunks(pipeline)
+    if corpus is None:
+        logger.warning(
+            "Could not read the indexed chunks from %s; substring labels will be "
+            "matched against retrieved results only, which overstates ranking "
+            "quality. Pass corpus=... to measure it properly.",
+            type(pipeline).__name__,
+        )
+    corpus_ids = {chunk.id for chunk in corpus} if corpus is not None else None
 
     buckets: Dict[str, List[float]] = {
         "precision@k": [],
@@ -226,18 +314,38 @@ def evaluate(
     }
     per_example: List[Dict[str, Any]] = []
 
+    unlabelled = 0
     for example in examples:
         results = pipeline.retrieve(example.question, k)
         retrieved_ids = [result.chunk.id for result in results]
-        relevant_ids = {
-            result.chunk.id for result in results if example.matches(result.chunk)
-        }
-        relevant_ids.update(example.relevant_ids)
+
+        relevant_ids = resolve_relevant(example, corpus)
+        if corpus is None:
+            # Degraded mode: no corpus available, fall back to the retrieved set.
+            relevant_ids.update(
+                result.chunk.id for result in results if example.matches(result.chunk)
+            )
+        elif corpus_ids is not None:
+            missing = [i for i in example.relevant_ids if i not in corpus_ids]
+            if missing:
+                logger.warning(
+                    "Question %r labels chunk id(s) %s that are not in the index",
+                    example.question[:60],
+                    ", ".join(sorted(missing)[:5]),
+                )
 
         record: Dict[str, Any] = {
             "question": example.question,
             "retrieved": retrieved_ids,
+            "num_relevant": len(relevant_ids),
         }
+
+        if not relevant_ids:
+            unlabelled += 1
+            logger.warning(
+                "Question %r matches no chunk in the index; it is scored as a miss",
+                example.question[:60],
+            )
 
         precision = precision_at_k(retrieved_ids, relevant_ids, k)
         hit = hit_rate_at_k(retrieved_ids, relevant_ids, k)
@@ -251,8 +359,8 @@ def evaluate(
             {"precision@k": precision, "hit_rate@k": hit, "mrr": rr, "ndcg@k": ndcg}
         )
 
-        if example.relevant_ids:
-            recall = recall_at_k(retrieved_ids, example.relevant_ids, k)
+        if relevant_ids:
+            recall = recall_at_k(retrieved_ids, relevant_ids, k)
             buckets["recall@k"].append(recall)
             record["recall@k"] = recall
 
@@ -278,6 +386,14 @@ def evaluate(
                 )
 
         per_example.append(record)
+
+    if unlabelled:
+        logger.warning(
+            "%d of %d question(s) had no relevant chunk in the index - check the "
+            "dataset labels against what was actually indexed",
+            unlabelled,
+            len(examples),
+        )
 
     metrics = {
         name: _average(values) for name, values in buckets.items() if values
