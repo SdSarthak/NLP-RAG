@@ -1,8 +1,12 @@
+import pytest
+
 from nlp_rag.config import RAGConfig
 from nlp_rag.documents import Chunk
 from nlp_rag.generation import (
     NO_CONTEXT_ANSWER,
+    AnthropicGenerator,
     ExtractiveGenerator,
+    GenerationError,
     build_prompt,
     format_context,
     get_generator,
@@ -100,3 +104,111 @@ def test_get_generator_falls_back_when_backend_unavailable(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     generator = get_generator(RAGConfig(generator="anthropic"))
     assert generator.name == "extractive"
+
+
+# ----------------------------------------------------------------------
+# Anthropic generator: response handling, without touching the network
+# ----------------------------------------------------------------------
+class _Block:
+    def __init__(self, text, type="text"):
+        self.text = text
+        self.type = type
+
+
+class _Response:
+    def __init__(self, content, stop_reason="end_turn"):
+        self.content = content
+        self.stop_reason = stop_reason
+
+
+class _FakeMessages:
+    def __init__(self, response=None, error=None):
+        self._response = response
+        self._error = error
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._error is not None:
+            raise self._error
+        return self._response
+
+
+class _FakeClient:
+    def __init__(self, response=None, error=None):
+        self.messages = _FakeMessages(response, error)
+
+
+def _anthropic(response=None, error=None, **kwargs):
+    return AnthropicGenerator(client=_FakeClient(response, error), **kwargs)
+
+
+def test_anthropic_generator_returns_text():
+    generator = _anthropic(_Response([_Block("Grounded answer. [1]")]))
+    assert generator.generate("q", [make_result("context")]) == "Grounded answer. [1]"
+
+
+def test_anthropic_generator_flags_a_truncated_answer():
+    """A response cut off at max_tokens must not be presented as complete."""
+    generator = _anthropic(
+        _Response([_Block("The answer begins but then st")], stop_reason="max_tokens")
+    )
+    answer = generator.generate("q", [make_result("context")])
+    assert answer.startswith("The answer begins but then st")
+    assert "truncated" in answer
+
+
+def test_anthropic_generator_handles_a_refusal():
+    generator = _anthropic(_Response([], stop_reason="refusal"))
+    assert "declined" in generator.generate("q", [make_result("context")])
+
+
+def test_anthropic_generator_handles_an_empty_response():
+    generator = _anthropic(_Response([]))
+    assert generator.generate("q", [make_result("context")]) == NO_CONTEXT_ANSWER
+
+
+def test_anthropic_generator_ignores_non_text_blocks():
+    generator = _anthropic(
+        _Response([_Block("", type="thinking"), _Block("Visible answer.")])
+    )
+    assert generator.generate("q", [make_result("context")]) == "Visible answer."
+
+
+def test_anthropic_generator_skips_the_api_without_context():
+    generator = _anthropic(_Response([_Block("should not be called")]))
+    assert generator.generate("q", []) == NO_CONTEXT_ANSWER
+    assert generator._client.messages.calls == []
+
+
+def test_anthropic_generator_wraps_transport_errors_with_a_hint():
+    generator = _anthropic(error=_named_error("APIConnectionError"))
+    with pytest.raises(GenerationError) as excinfo:
+        generator.generate("q", [make_result("context")])
+    assert "Could not reach the Claude API" in str(excinfo.value)
+
+
+def test_anthropic_generator_wraps_unknown_errors():
+    generator = _anthropic(error=RuntimeError("boom"))
+    with pytest.raises(GenerationError, match="boom"):
+        generator.generate("q", [make_result("context")])
+
+
+def test_anthropic_generator_rejects_bad_max_tokens():
+    with pytest.raises(ValueError):
+        _anthropic(_Response([]), max_tokens=0)
+
+
+def test_anthropic_generator_sends_the_configured_model_and_limit():
+    generator = _anthropic(
+        _Response([_Block("ok")]), model="claude-opus-5", max_tokens=1234
+    )
+    generator.generate("q", [make_result("context")])
+    call = generator._client.messages.calls[0]
+    assert call["model"] == "claude-opus-5"
+    assert call["max_tokens"] == 1234
+    assert call["messages"][0]["role"] == "user"
+
+
+def _named_error(name):
+    return type(name, (Exception,), {})("transport failure")

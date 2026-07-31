@@ -247,30 +247,49 @@ class AnthropicGenerator(Generator):
 
     name = "anthropic"
 
+    #: The SDK default is 10 minutes, which hangs a CLI on a stalled connection.
+    DEFAULT_TIMEOUT = 60.0
+    DEFAULT_MAX_RETRIES = 2
+
+    TRUNCATION_NOTICE = (
+        " [...answer truncated at the token limit; raise NLP_RAG_ANTHROPIC_MAX_TOKENS "
+        "for a complete answer]"
+    )
+
     def __init__(
         self,
         model: str = "claude-opus-5",
         max_tokens: int = 4096,
         max_context_chars: int = 6000,
+        timeout: float = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        client: Any = None,
     ) -> None:
-        try:
-            import anthropic
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise ImportError(
-                "anthropic is not installed. Run `pip install anthropic` "
-                "or use the extractive generator."
-            ) from exc
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
 
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            raise GenerationError(
-                "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and fill "
-                "it in, or choose a different generator."
-            )
+        if client is None:
+            try:
+                import anthropic
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                raise ImportError(
+                    "anthropic is not installed. Run `pip install anthropic` "
+                    "or use the extractive generator."
+                ) from exc
+
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                raise GenerationError(
+                    "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and "
+                    "fill it in, or choose a different generator."
+                )
+            # An unbounded request would hang the CLI indefinitely; the SDK
+            # retries connection errors, 429 and 5xx on its own.
+            client = anthropic.Anthropic(timeout=timeout, max_retries=max_retries)
 
         self.model = model
         self.max_tokens = max_tokens
         self.max_context_chars = max_context_chars
-        self._client = anthropic.Anthropic()
+        self._client = client
 
     def generate(self, question: str, results: Sequence[RetrievedChunk]) -> str:
         if not results:
@@ -291,9 +310,10 @@ class AnthropicGenerator(Generator):
                 messages=[{"role": "user", "content": user_message}],
             )
         except Exception as exc:
-            raise GenerationError(f"Claude API request failed: {exc}") from exc
+            raise GenerationError(self._explain(exc)) from exc
 
-        if getattr(response, "stop_reason", None) == "refusal":
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "refusal":
             return (
                 "The model declined to answer this request. "
                 "Try rephrasing the question."
@@ -301,10 +321,36 @@ class AnthropicGenerator(Generator):
 
         text = "\n".join(
             block.text
-            for block in response.content
+            for block in (getattr(response, "content", None) or [])
             if getattr(block, "type", None) == "text"
         ).strip()
-        return text or NO_CONTEXT_ANSWER
+        if not text:
+            return NO_CONTEXT_ANSWER
+        if stop_reason == "max_tokens":
+            # Returning a sentence that stops mid-word as if it were the whole
+            # answer is worse than saying it was cut off.
+            logger.warning(
+                "Claude response hit max_tokens (%d); the answer is truncated",
+                self.max_tokens,
+            )
+            return text + self.TRUNCATION_NOTICE
+        return text
+
+    @staticmethod
+    def _explain(exc: Exception) -> str:
+        """Turn an SDK exception into something the user can act on."""
+        name = type(exc).__name__
+        hints = {
+            "AuthenticationError": "ANTHROPIC_API_KEY is invalid or revoked.",
+            "PermissionDeniedError": "This API key cannot use the requested model.",
+            "NotFoundError": "Unknown model id - check NLP_RAG_ANTHROPIC_MODEL.",
+            "RateLimitError": "Rate limited; retry shortly or lower the query rate.",
+            "APIConnectionError": "Could not reach the Claude API - check connectivity.",
+            "APITimeoutError": "The Claude API did not respond in time.",
+        }
+        hint = hints.get(name)
+        base = f"Claude API request failed ({name}): {exc}"
+        return f"{base}. {hint}" if hint else base
 
     def describe(self) -> Dict[str, Any]:
         return {"name": self.name, "model": self.model}
