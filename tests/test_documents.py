@@ -139,3 +139,52 @@ def test_load_document_errors(tmp_path):
     unsupported.write_bytes(b"\x00")
     with pytest.raises(DocumentError):
         load_document(unsupported)
+
+
+def test_load_document_rejects_a_directory(tmp_path):
+    (tmp_path / "sub").mkdir()
+    with pytest.raises(DocumentError):
+        load_document(tmp_path / "sub")
+
+
+def test_unreadable_file_becomes_a_document_error(tmp_path, monkeypatch):
+    path = tmp_path / "locked.txt"
+    path.write_text("content", encoding="utf-8")
+
+    def deny(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "read_text", deny)
+    with pytest.raises(DocumentError, match="Cannot read"):
+        load_document(path)
+
+
+def test_one_unreadable_file_does_not_abort_a_directory_scan(tmp_path, monkeypatch):
+    """A single locked file used to raise PermissionError out of the whole scan."""
+    (tmp_path / "good.txt").write_text("readable content here", encoding="utf-8")
+    (tmp_path / "bad.txt").write_text("unreadable", encoding="utf-8")
+
+    real_read_text = Path.read_text
+
+    def selective(self, *args, **kwargs):
+        if self.name == "bad.txt":
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", selective)
+    documents = load_directory(tmp_path)
+    assert [Path(d.source).name for d in documents] == ["good.txt"]
+
+
+def test_load_directory_rejects_a_file(tmp_path):
+    path = tmp_path / "a.txt"
+    path.write_text("x", encoding="utf-8")
+    with pytest.raises(DocumentError):
+        load_directory(path)
+
+
+def test_binary_content_in_a_text_file_does_not_crash(tmp_path):
+    path = tmp_path / "mixed.txt"
+    path.write_bytes(b"valid text \xff\xfe more text after invalid bytes")
+    document = load_document(path)
+    assert "valid text" in document.text

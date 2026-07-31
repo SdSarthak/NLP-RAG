@@ -287,7 +287,12 @@ def chunk_documents(
 # ----------------------------------------------------------------------
 def load_text_file(path: Path) -> RawDocument:
     path = Path(path)
-    text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        # Permission denied, a broken symlink, a device that went away: one bad
+        # file must not abort a whole directory scan.
+        raise DocumentError(f"Cannot read {path}: {exc}") from exc
     return RawDocument(
         source=str(path),
         text=text,
@@ -363,15 +368,29 @@ def load_directory(path: Path | str, recursive: bool = True) -> List[RawDocument
 
     pattern = "**/*" if recursive else "*"
     documents: List[RawDocument] = []
-    for candidate in sorted(path.glob(pattern)):
-        if not candidate.is_file():
+    skipped = 0
+    try:
+        candidates = sorted(path.glob(pattern))
+    except OSError as exc:
+        raise DocumentError(f"Cannot list {path}: {exc}") from exc
+
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+        except OSError:  # pragma: no cover - broken link or vanished entry
             continue
         if candidate.suffix.lower() not in SUPPORTED_SUFFIXES:
             continue
         try:
             documents.append(load_document(candidate))
         except DocumentError as exc:
+            skipped += 1
             logger.warning("Skipping %s: %s", candidate, exc)
+    if skipped:
+        logger.warning(
+            "Skipped %d unreadable file(s) under %s", skipped, path
+        )
     return documents
 
 

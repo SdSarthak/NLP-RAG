@@ -117,8 +117,22 @@ class RAGConfig:
                     raw,
                 )
 
+        unknown = set(overrides) - {f.name for f in fields(cls)}
+        if unknown:
+            raise TypeError(
+                f"Unknown config field(s): {', '.join(sorted(unknown))}"
+            )
         values.update({k: v for k, v in overrides.items() if v is not None})
-        return cls(**values)
+
+        try:
+            return cls(**values)
+        except ValueError as exc:
+            from_env = sorted(name for name in values if _env(name) is not None)
+            if from_env:
+                raise ValueError(
+                    f"{exc} (check {', '.join(ENV_PREFIX + n.upper() for n in from_env)})"
+                ) from exc
+            raise
 
     def replace(self, **overrides: Any) -> "RAGConfig":
         """Return a copy with the given (non-None) fields replaced."""
