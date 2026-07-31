@@ -120,3 +120,79 @@ def test_bm25_scores_are_non_negative(bm25, chunks):
     assert all(score >= 0 for score in scores)
     assert scores[2] == max(scores)
     assert not np.isnan(scores).any()
+
+
+# ----------------------------------------------------------------------
+# BM25 inverted index
+# ----------------------------------------------------------------------
+def test_bm25_retrieve_agrees_with_scoring_every_document(bm25, chunks):
+    """The inverted index must reproduce an exhaustive scan exactly."""
+    query = "lexical ranking function term frequency"
+    tokens = content_tokens(query)
+
+    exhaustive = sorted(
+        ((i, bm25.score(tokens, i)) for i in range(len(chunks))),
+        key=lambda item: (-item[1], item[0]),
+    )
+    expected = [(f"c{i}", s) for i, s in exhaustive if s > 0.0]
+
+    results = bm25.retrieve(query, top_k=len(chunks))
+    assert [r.chunk.id for r in results] == [i for i, _ in expected]
+    for result, (_, score) in zip(results, expected):
+        assert result.score == pytest.approx(score)
+
+
+def test_bm25_length_normalisation_is_refreshed_after_a_later_add(bm25):
+    """Average document length changes on add; stale norms would skew scores."""
+    before = bm25.retrieve("lexical ranking function", top_k=1)[0].score
+
+    bm25.add(
+        [
+            Chunk(
+                id=f"long{i}",
+                text=" ".join(["filler"] * 200),
+                source="corpus",
+                index=100 + i,
+            )
+            for i in range(5)
+        ]
+    )
+    after = bm25.retrieve("lexical ranking function", top_k=1)[0]
+
+    tokens = content_tokens("lexical ranking function")
+    assert after.score == pytest.approx(bm25.score(tokens, 0))
+    assert after.score != pytest.approx(before)
+
+
+def test_bm25_only_touches_documents_containing_a_query_term(bm25):
+    postings = bm25._postings
+    assert set(postings["lexical"]) == {(0, 1)}
+    assert "zebra" not in postings or not postings["zebra"]
+
+
+def test_bm25_repeated_query_terms_do_not_double_count(bm25):
+    once = bm25.retrieve("lexical", top_k=1)[0].score
+    twice = bm25.retrieve("lexical lexical lexical", top_k=1)[0].score
+    assert once == pytest.approx(twice)
+
+
+def test_bm25_score_rejects_an_out_of_range_document(bm25, chunks):
+    with pytest.raises(IndexError):
+        bm25.score(["lexical"], len(chunks))
+
+
+def test_bm25_rejects_invalid_parameters():
+    with pytest.raises(ValueError):
+        BM25Retriever(k1=-1.0)
+    with pytest.raises(ValueError):
+        BM25Retriever(b=1.5)
+
+
+def test_bm25_on_an_empty_index():
+    assert BM25Retriever().retrieve("anything", top_k=3) == []
+
+
+def test_dense_retriever_ignores_a_termless_query(dense):
+    """A zero embedding scored every chunk 0.0 and returned an arbitrary slice."""
+    assert dense.retrieve("???", top_k=3) == []
+    assert dense.retrieve("anything", top_k=0) == []

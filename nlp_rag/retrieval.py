@@ -7,7 +7,7 @@ import math
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -100,11 +100,21 @@ class DenseRetriever(Retriever):
 
 
 class BM25Retriever(Retriever):
-    """Okapi BM25 over the same chunks, for exact-term matching."""
+    """Okapi BM25 over the same chunks, for exact-term matching.
+
+    Scoring goes through an inverted index, so a query only touches the chunks
+    that actually contain one of its terms. Scanning every chunk (the obvious
+    implementation) costs the same whether the query matches three documents or
+    three hundred thousand.
+    """
 
     name = "bm25"
 
     def __init__(self, k1: float = 1.5, b: float = 0.75) -> None:
+        if k1 < 0:
+            raise ValueError("k1 must be >= 0")
+        if not 0.0 <= b <= 1.0:
+            raise ValueError("b must be between 0 and 1")
         self.k1 = k1
         self.b = b
         self.chunks: List[Chunk] = []
@@ -112,20 +122,41 @@ class BM25Retriever(Retriever):
         self._lengths: List[int] = []
         self._doc_freq: Counter = Counter()
         self._avg_len = 0.0
+        # term -> [(doc index, term frequency), ...]
+        self._postings: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        # Per-document length normalisation. Depends on the average document
+        # length, so adding chunks invalidates it; it is rebuilt on demand
+        # rather than on every add, keeping add() linear in the new chunks only.
+        self._denominators: List[float] = []
+        self._dirty = True
 
     def add(self, chunks: Sequence[Chunk]) -> None:
         for chunk in chunks:
             tokens = content_tokens(chunk.text)
             freqs = Counter(tokens)
+            doc_index = len(self.chunks)
             self.chunks.append(chunk)
             self._term_freqs.append(freqs)
             self._lengths.append(len(tokens))
             self._doc_freq.update(freqs.keys())
+            for term, tf in freqs.items():
+                self._postings[term].append((doc_index, tf))
         total = sum(self._lengths)
         self._avg_len = total / len(self._lengths) if self._lengths else 0.0
+        self._dirty = True
 
     def __len__(self) -> int:
         return len(self.chunks)
+
+    def _refresh(self) -> None:
+        if not self._dirty:
+            return
+        average = self._avg_len or 1.0
+        k1, b = self.k1, self.b
+        self._denominators = [
+            k1 * (1 - b + b * (length or 1) / average) for length in self._lengths
+        ]
+        self._dirty = False
 
     def _idf(self, term: str) -> float:
         n = len(self.chunks)
@@ -134,11 +165,14 @@ class BM25Retriever(Retriever):
         return math.log(1.0 + (n - df + 0.5) / (df + 0.5))
 
     def score(self, query_tokens: Sequence[str], doc_index: int) -> float:
+        """BM25 score of one document. Kept for introspection and testing."""
+        if not 0 <= doc_index < len(self.chunks):
+            raise IndexError(f"no document at index {doc_index}")
+        self._refresh()
         freqs = self._term_freqs[doc_index]
-        length = self._lengths[doc_index] or 1
-        norm = self.k1 * (1 - self.b + self.b * length / (self._avg_len or 1.0))
+        norm = self._denominators[doc_index]
         total = 0.0
-        for term in query_tokens:
+        for term in set(query_tokens):
             tf = freqs.get(term, 0)
             if not tf:
                 continue
@@ -148,16 +182,26 @@ class BM25Retriever(Retriever):
     def retrieve(self, query: str, top_k: int) -> List[RetrievedChunk]:
         if not self.chunks or top_k <= 0:
             return []
-        query_tokens = content_tokens(query)
+        query_tokens = set(content_tokens(query))
         if not query_tokens:
             return []
 
-        scored = [
-            (index, self.score(query_tokens, index))
-            for index in range(len(self.chunks))
-        ]
-        scored = [item for item in scored if item[1] > 0.0]
-        scored.sort(key=lambda item: (-item[1], item[0]))
+        self._refresh()
+        denominators = self._denominators
+        k1_plus_one = self.k1 + 1.0
+        scores: Dict[int, float] = defaultdict(float)
+        for term in query_tokens:
+            postings = self._postings.get(term)
+            if not postings:
+                continue
+            weight = self._idf(term) * k1_plus_one
+            for doc_index, tf in postings:
+                scores[doc_index] += weight * tf / (tf + denominators[doc_index])
+
+        ranked = sorted(
+            ((index, score) for index, score in scores.items() if score > 0.0),
+            key=lambda item: (-item[1], item[0]),
+        )
         return [
             RetrievedChunk(
                 chunk=self.chunks[index],
@@ -166,7 +210,7 @@ class BM25Retriever(Retriever):
                 retriever=self.name,
                 components={"bm25": score},
             )
-            for rank, (index, score) in enumerate(scored[:top_k], start=1)
+            for rank, (index, score) in enumerate(ranked[:top_k], start=1)
         ]
 
 
